@@ -19,14 +19,20 @@ final class Statements {
             Pattern.compile("^CREATE\\s+(TEMPORARY\\s+)?TABLE\\b", Pattern.CASE_INSENSITIVE);
     private static final Pattern KAFKA_CONNECTOR =
             Pattern.compile("'connector'\\s*=\\s*'(upsert-)?kafka'", Pattern.CASE_INSENSITIVE);
+    private static final Pattern DORIS_CONNECTOR =
+            Pattern.compile("'connector'\\s*=\\s*'doris'", Pattern.CASE_INSENSITIVE);
     private static final Pattern EMPTY_OPTION =
             Pattern.compile("'[^']+'\\s*=\\s*''(?!')");
     private static final Pattern WITH_OPEN = Pattern.compile("\\bWITH\\s*\\(", Pattern.CASE_INSENSITIVE);
 
-    /** 托管 Flink 自己管 checkpoint / 重启 / 状态后端，作业里再设会被忽略或冲突，跳过。 */
-    private static final String[] MANAGED_PREFIXES = {
-        "execution.checkpointing.", "restart-strategy", "state.backend", "state.checkpoints", "state.savepoints",
-    };
+    /**
+     * 托管 Flink 自己管 checkpoint / 重启 / 状态 / 并行度，作业里再设会被忽略或和控制台配置冲突，跳过。
+     * 规则与生产 jar telemetry-managed-flink-0.1.3 的 Statements.managedByService 一致。
+     */
+    private static final String[] MANAGED_PREFIXES = {"execution.checkpointing.", "restart-strategy", "state."};
+
+    /** 并行度由控制台的 Parallelism / ParallelismPerKPU（及自动扩缩容）决定。精确匹配，不影响 parallelism.* 的其他键。 */
+    private static final String MANAGED_PARALLELISM = "parallelism.default";
 
     private Statements() {}
 
@@ -36,7 +42,7 @@ final class Statements {
                 return true;
             }
         }
-        return false;
+        return key.equals(MANAGED_PARALLELISM);
     }
 
     /** SET 'k' = 'v' → {k, v}；不是 SET 返回 null。 */
@@ -119,6 +125,19 @@ final class Statements {
         }
         String trimmedBody = body.replaceAll("\\s+$", "");
         return stmt.substring(0, range[0]) + trimmedBody + extra + "\n" + stmt.substring(range[1]);
+    }
+
+    static boolean isDorisTable(String stmt) {
+        return CREATE_TABLE.matcher(stmt).find() && DORIS_CONNECTOR.matcher(stmt).find();
+    }
+
+    /** 把 WITH ( ... ) 整个换成 'connector' = 'blackhole'，保留表结构。用于离线校验 SQL。 */
+    static String toBlackhole(String stmt) {
+        int[] range = withClauseRange(stmt);
+        if (range == null) {
+            throw new IllegalArgumentException("没有 WITH 子句：" + head(stmt));
+        }
+        return stmt.substring(0, range[0]) + "'connector' = 'blackhole'" + stmt.substring(range[1]);
     }
 
     /** 语句第一行，日志用。 */

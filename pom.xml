@@ -4,7 +4,7 @@
 
   托管 Flink 没有 SQL Client，一个应用就是一个 jar 的 main()。本工程把 sql/ 下的 SQL 打进 jar，
   由 SqlJobRunner 在运行时：用应用属性替换 ${VAR}、可选从 Secrets Manager 读 Doris 账号、
-  可选给 Kafka 表补 MSK IAM 认证、跳过由托管服务接管的 SET（checkpoint / restart），然后提交。
+  可选给 Kafka 表补 MSK IAM 认证、跳过由托管服务接管的 SET（checkpoint / restart / state / 并行度），然后提交。
 
   依赖：Flink 本体由托管运行时提供（provided）；连接器打进 fat jar。
   本地运行：mvn -Plocal ...，把 Flink 依赖切成 compile 并加上 planner / clients。
@@ -34,6 +34,7 @@
 
     <flink.deps.scope>provided</flink.deps.scope>
     <main.class>com.zymix.flink.SqlJobRunner</main.class>
+    <run.args/>
   </properties>
 
   <dependencyManagement>
@@ -133,6 +134,12 @@
           <artifactId>flink-clients</artifactId>
           <version>${flink.version}</version>
         </dependency>
+        <!-- 线上由 flink-dist 提供，本地要自己加，否则 Kafka 连接器找不到 DeliveryGuarantee -->
+        <dependency>
+          <groupId>org.apache.flink</groupId>
+          <artifactId>flink-connector-base</artifactId>
+          <version>${flink.version}</version>
+        </dependency>
         <dependency>
           <groupId>org.apache.flink</groupId>
           <artifactId>flink-table-planner-loader</artifactId>
@@ -186,15 +193,15 @@
         <groupId>org.codehaus.mojo</groupId>
         <artifactId>exec-maven-plugin</artifactId>
         <version>3.5.0</version>
+        <!--
+          本地运行：mvn -Plocal compile exec:exec -Drun.args="(运行器参数，见 README)"
+          用 exec:exec 起独立 JVM，而不是 exec:java：Flink MiniCluster 在 Maven 的类加载器里跑作业会
+          ClassNotFoundException（org.apache.flink.api.common.ExecutionConfig）。
+        -->
         <configuration>
-          <mainClass>${main.class}</mainClass>
+          <executable>java</executable>
           <classpathScope>compile</classpathScope>
-          <systemProperties>
-            <systemProperty>
-              <key>log4j2.configurationFile</key>
-              <value>${project.basedir}/config/log4j2-local.properties</value>
-            </systemProperty>
-          </systemProperties>
+          <commandlineArgs>-Dlog4j2.configurationFile=${project.basedir}/config/log4j2-local.properties -classpath %classpath ${main.class} ${run.args}</commandlineArgs>
         </configuration>
       </plugin>
       <plugin>

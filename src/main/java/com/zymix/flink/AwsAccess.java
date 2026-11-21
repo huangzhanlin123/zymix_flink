@@ -24,12 +24,14 @@ final class AwsAccess {
     private static final ObjectMapper JSON = new ObjectMapper();
 
     private final String roleArn;
-    private final String region;
+    private final String stsRegion;
+    private final String secretRegion;
     private final String sessionName;
 
-    AwsAccess(String roleArn, String region, String sessionName) {
+    AwsAccess(String roleArn, String stsRegion, String secretRegion, String sessionName) {
         this.roleArn = blankToNull(roleArn);
-        this.region = blankToNull(region);
+        this.stsRegion = blankToNull(stsRegion);
+        this.secretRegion = blankToNull(secretRegion);
         this.sessionName = sessionName;
     }
 
@@ -39,8 +41,8 @@ final class AwsAccess {
         if (roleArn != null) {
             jaas.append(" awsRoleArn=\"").append(roleArn).append('"')
                     .append(" awsRoleSessionName=\"").append(sessionName).append('"');
-            if (region != null) {
-                jaas.append(" awsStsRegion=\"").append(region).append('"');
+            if (stsRegion != null) {
+                jaas.append(" awsStsRegion=\"").append(stsRegion).append('"');
             }
         }
         jaas.append(';');
@@ -54,11 +56,11 @@ final class AwsAccess {
         return opts;
     }
 
-    /** 读一个 JSON 格式的 secret（如 {"username": "...", "password": "..."}），返回扁平的 key → value。 */
+    /** 读一个 JSON 格式的 secret（如 {"DORIS_USER": "...", "DORIS_PASSWORD": "..."}），返回扁平的 key → value。 */
     Map<String, String> readSecret(String secretId) {
         var builder = SecretsManagerClient.builder().credentialsProvider(credentials());
-        if (region != null) {
-            builder.region(Region.of(region));
+        if (secretRegion != null) {
+            builder.region(Region.of(secretRegion));
         }
         try (SecretsManagerClient sm = builder.build()) {
             String raw = sm.getSecretValue(GetSecretValueRequest.builder().secretId(secretId).build()).secretString();
@@ -76,8 +78,8 @@ final class AwsAccess {
             return DefaultCredentialsProvider.create();
         }
         var sts = StsClient.builder();
-        if (region != null) {
-            sts.region(Region.of(region));
+        if (stsRegion != null) {
+            sts.region(Region.of(stsRegion));
         }
         return StsAssumeRoleCredentialsProvider.builder()
                 .stsClient(sts.build())

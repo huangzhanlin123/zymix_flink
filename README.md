@@ -10,6 +10,8 @@ Flink SQL 作业工程，部署到 AWS Managed Service for Apache Flink。
 
 ```
 sql/                    Flink SQL 脚本，构建时打进 jar 的 sql/ 目录
+  telemetry_kafka_to_zymix_ods.sql  埋点 telemetry.events → zymix_ods.app_events
+ddl/zymix_ods/          VeloDB 建表语句（需有写权限的账号执行）
 src/main/java/com/zymix/flink/
   SqlJobRunner.java     入口：读配置 → 解析脚本 → 提交作业
   SqlScript.java        脚本切分（注释 / 字符串 / STATEMENT SET）
@@ -24,7 +26,7 @@ config/log4j2-local.properties  本地运行的日志配置
 1. 读变量：托管 Flink 上来自应用的 Runtime properties（所有分组合并）；本地来自 `--props` 文件，缺的再找环境变量。
 2. 读 `SQL_FILE` 指定的脚本（本地文件或 jar 内 `sql/`）。
 3. 替换 `${VAR}` / `${VAR:默认值}`；缺变量时一次列出全部缺的名字。值为空串的 WITH 选项会被去掉。
-4. `SET` → 作业配置。托管 Flink 上跳过 `execution.checkpointing.*`、`restart-strategy`、`state.*`，这些在控制台里配。
+4. `SET` → 作业配置。托管 Flink 上跳过 `execution.checkpointing.*`、`restart-strategy*`、`state.*`、`parallelism.default`（与生产 jar 规则一致），这些在控制台里配。
 5. `KAFKA_IAM=true` 时给 Kafka 表补 `SASL_SSL` + `AWS_MSK_IAM`；设了 `AWS_DATA_ROLE_ARN` 就扮演该角色。
 6. 设了 `DORIS_SECRET_ID` 时从 Secrets Manager 读 `username` / `password`，写入 `DORIS_USER` / `DORIS_PASSWORD`。
 7. 所有 INSERT 合进一个 StatementSet 提交。
@@ -35,23 +37,32 @@ config/log4j2-local.properties  本地运行的日志配置
 # 编译 + 单测 + 打 fat jar（target/zymix-flink-<version>.jar）
 mvn package
 
-# 只看解析结果，不连 Kafka / Doris
 cp local/example.properties local/ods.properties
-mvn -Plocal -q compile exec:java -Dexec.args="--props local/ods.properties --dry-run"
+
+# 只看变量替换后的语句，不连 Kafka / Doris
+mvn -Plocal -q compile exec:exec -Drun.args="--props local/ods.properties --dry-run"
+
+# 让 Flink 校验 SQL 并打印执行计划（Doris 表临时换成 blackhole），不连外部系统
+mvn -Plocal -q compile exec:exec -Drun.args="--props local/ods.properties --explain"
 
 # 本地真跑（MiniCluster，需要能连到 Kafka 和 Doris）
-mvn -Plocal -q compile exec:java -Dexec.args="--props local/ods.properties"
+mvn -Plocal -q compile exec:exec -Drun.args="--props local/ods.properties"
 ```
 
 ## 部署到托管 Flink
 
-1. `mvn package`，把 `target/zymix-flink-<version>.jar` 传到 S3。
-2. 应用选 Apache Flink **1.20** 运行时，代码位置指向这个 jar。
-3. Runtime properties 填 `local/example.properties` 里的键（分组名随意），至少要有 `SQL_FILE`。
-4. Checkpoint / 并行度 / 重启策略在应用配置里设，脚本里的同类 SET 会被跳过。
+一键脚本 [scripts/deploy_app_events.sh](scripts/deploy_app_events.sh)，在托管 Flink 所在账号的 AWS CloudShell 里运行：
+
+1. `mvn clean package`，把 `target/zymix-flink-0.1.0-SNAPSHOT.jar` 和脚本上传到 CloudShell。
+2. `bash deploy_app_events.sh`：打印部署计划，输入 `yes` 后执行。加 `START=1` 会顺便启动。
+
+脚本复用线上应用 `telemetry_kafka_to_ods` 的服务角色、VPC、代码桶、日志组、Kafka / Doris 地址和 `aws` 属性组（跨账号数据角色），
+jar 传到同一个桶，应用不存在就创建（Flink 1.20），存在就更新代码和属性；每次部署自动换 `ZYMIX_ODS_LABEL_PREFIX`。
+Doris 账号从 Secrets Manager `next/prod/flink/velodb_etl` 读（字段 `DORIS_USER` / `DORIS_PASSWORD`），密码不进应用配置。
+Checkpoint 用服务默认配置，并行度 1；脚本里的同类 SET 会被跳过。
 
 ## 注意
 
-- `TELEMETRY_ODS_LABEL_PREFIX` 每次重新提交（不从快照恢复）都要换，否则 Doris label 冲突，作业反复重启。
-- VeloDB（存算分离）对 MoW 表不支持 2PC stream load，`TELEMETRY_ODS_ENABLE_2PC` 必须是 `false`。
+- `ZYMIX_ODS_LABEL_PREFIX` 每次重新提交（不从快照恢复）都要换，否则 Doris label 冲突，作业反复重启。
+- VeloDB（存算分离）对 MoW 表不支持 2PC stream load，写 VeloDB 的 Doris sink 必须 `'sink.enable-2pc' = 'false'`。
 - 新增脚本直接放进 `sql/`，用 `SQL_FILE` 选择；一个托管应用跑一个脚本。

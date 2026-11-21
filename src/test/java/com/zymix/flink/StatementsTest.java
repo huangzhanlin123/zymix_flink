@@ -30,7 +30,12 @@ class StatementsTest {
         assertNull(Statements.parseSet("CREATE TABLE t (a INT)"));
         assertTrue(Statements.managedByService("execution.checkpointing.interval"));
         assertTrue(Statements.managedByService("restart-strategy"));
+        assertTrue(Statements.managedByService("restart-strategy.exponential-delay.max-backoff"));
+        assertTrue(Statements.managedByService("state.backend.rocksdb.memory.managed"));
+        assertTrue(Statements.managedByService("parallelism.default"));
         assertFalse(Statements.managedByService("pipeline.name"));
+        assertFalse(Statements.managedByService("table.exec.state.ttl"));
+        assertFalse(Statements.managedByService("table.local-time-zone"));
     }
 
     @Test
