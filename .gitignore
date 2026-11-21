@@ -1,0 +1,16 @@
+target/
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+.DS_Store
+*.log
+
+# 本地变量文件可能含密码，只保留模板
+local/*
+!local/example.properties
+
+*.pem
+.env

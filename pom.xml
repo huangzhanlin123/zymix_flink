@@ -1,0 +1,241 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  zymix Flink SQL 作业（Flink 1.20 / JDK 11），部署目标：AWS Managed Service for Apache Flink。
+
+  托管 Flink 没有 SQL Client，一个应用就是一个 jar 的 main()。本工程把 sql/ 下的 SQL 打进 jar，
+  由 SqlJobRunner 在运行时：用应用属性替换 ${VAR}、可选从 Secrets Manager 读 Doris 账号、
+  可选给 Kafka 表补 MSK IAM 认证、跳过由托管服务接管的 SET（checkpoint / restart），然后提交。
+
+  依赖：Flink 本体由托管运行时提供（provided）；连接器打进 fat jar。
+  本地运行：mvn -Plocal ...，把 Flink 依赖切成 compile 并加上 planner / clients。
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.zymix</groupId>
+  <artifactId>zymix-flink</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+  <packaging>jar</packaging>
+
+  <properties>
+    <maven.compiler.release>11</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+    <flink.version>1.20.5</flink.version>
+    <!-- 以下版本与生产 jar telemetry-managed-flink-0.1.3 一致 -->
+    <kafka.connector.version>3.4.0-1.20</kafka.connector.version>
+    <doris.connector.version>25.0.0</doris.connector.version>
+    <msk.iam.version>2.3.2</msk.iam.version>
+    <kda.runtime.version>1.2.0</kda.runtime.version>
+    <awssdk.version>2.30.23</awssdk.version>
+    <jackson.version>2.18.4</jackson.version>
+    <log4j.version>2.24.3</log4j.version>
+    <junit.version>5.12.2</junit.version>
+
+    <flink.deps.scope>provided</flink.deps.scope>
+    <main.class>com.zymix.flink.SqlJobRunner</main.class>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <!--
+        Jackson 三件必须同一版本：只钉 databind 时 jackson-core 会被传递依赖拉回旧版，
+        MSK IAM 签名时 NoSuchMethodError。放在 awssdk bom 前面，先到先得。
+      -->
+      <dependency>
+        <groupId>com.fasterxml.jackson</groupId>
+        <artifactId>jackson-bom</artifactId>
+        <version>${jackson.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>software.amazon.awssdk</groupId>
+        <artifactId>bom</artifactId>
+        <version>${awssdk.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <!-- Flink 本体：托管运行时提供 -->
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-streaming-java</artifactId>
+      <version>${flink.version}</version>
+      <scope>${flink.deps.scope}</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-table-api-java-bridge</artifactId>
+      <version>${flink.version}</version>
+      <scope>${flink.deps.scope}</scope>
+    </dependency>
+
+    <!-- 打进 jar -->
+    <dependency>
+      <groupId>com.amazonaws</groupId>
+      <artifactId>aws-kinesisanalytics-runtime</artifactId>
+      <version>${kda.runtime.version}</version>
+    </dependency>
+    <!--
+      Kafka 用非 shaded 的 flink-connector-kafka + kafka-clients：shaded 的 sql 连接器改了
+      org.apache.kafka 的包名，aws-msk-iam-auth 的 LoginModule / CallbackHandler 对不上。
+    -->
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-connector-kafka</artifactId>
+      <version>${kafka.connector.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.msk</groupId>
+      <artifactId>aws-msk-iam-auth</artifactId>
+      <version>${msk.iam.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.doris</groupId>
+      <artifactId>flink-doris-connector-1.20</artifactId>
+      <version>${doris.connector.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>secretsmanager</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>sts</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <profiles>
+    <!-- 本地运行 / IDE 调试：Flink 依赖切成 compile，补上本地执行需要的模块和日志实现 -->
+    <profile>
+      <id>local</id>
+      <properties>
+        <flink.deps.scope>compile</flink.deps.scope>
+      </properties>
+      <dependencies>
+        <dependency>
+          <groupId>org.apache.flink</groupId>
+          <artifactId>flink-clients</artifactId>
+          <version>${flink.version}</version>
+        </dependency>
+        <dependency>
+          <groupId>org.apache.flink</groupId>
+          <artifactId>flink-table-planner-loader</artifactId>
+          <version>${flink.version}</version>
+        </dependency>
+        <dependency>
+          <groupId>org.apache.flink</groupId>
+          <artifactId>flink-table-runtime</artifactId>
+          <version>${flink.version}</version>
+        </dependency>
+        <dependency>
+          <groupId>org.apache.flink</groupId>
+          <artifactId>flink-runtime-web</artifactId>
+          <version>${flink.version}</version>
+        </dependency>
+        <dependency>
+          <groupId>org.apache.logging.log4j</groupId>
+          <artifactId>log4j-slf4j2-impl</artifactId>
+          <version>${log4j.version}</version>
+        </dependency>
+        <dependency>
+          <groupId>org.apache.logging.log4j</groupId>
+          <artifactId>log4j-core</artifactId>
+          <version>${log4j.version}</version>
+        </dependency>
+      </dependencies>
+    </profile>
+  </profiles>
+
+  <build>
+    <resources>
+      <!-- SQL 只有一份：仓库根目录 sql/，构建时复制进 jar 的 sql/ 目录 -->
+      <resource>
+        <directory>sql</directory>
+        <targetPath>sql</targetPath>
+        <includes>
+          <include>*.sql</include>
+        </includes>
+      </resource>
+      <resource>
+        <directory>src/main/resources</directory>
+      </resource>
+    </resources>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.5.3</version>
+      </plugin>
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.5.0</version>
+        <configuration>
+          <mainClass>${main.class}</mainClass>
+          <classpathScope>compile</classpathScope>
+          <systemProperties>
+            <systemProperty>
+              <key>log4j2.configurationFile</key>
+              <value>${project.basedir}/config/log4j2-local.properties</value>
+            </systemProperty>
+          </systemProperties>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.6.1</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>shade</goal></goals>
+            <configuration>
+              <createDependencyReducedPom>false</createDependencyReducedPom>
+              <artifactSet>
+                <excludes>
+                  <exclude>org.apache.flink:flink-shaded-force-shading</exclude>
+                  <exclude>com.google.code.findbugs:jsr305</exclude>
+                  <exclude>org.slf4j:*</exclude>
+                  <exclude>org.apache.logging.log4j:*</exclude>
+                </excludes>
+              </artifactSet>
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+              <transformers>
+                <!-- 连接器靠 SPI 注册 DynamicTableFactory，不合并 services 文件就只剩一个连接器可用 -->
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <mainClass>${main.class}</mainClass>
+                </transformer>
+              </transformers>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>
