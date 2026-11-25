@@ -228,7 +228,7 @@ if [[ "$ACTION" == "创建" ]]; then
     --arg logarn "$LOG_STREAM_ARN" '
     {
       ApplicationName: $name,
-      ApplicationDescription: "Kafka telemetry.events -> zymix_ods.app_events (zymix_flink)",
+      ApplicationDescription: "Kafka telemetry.events(.dlq) -> zymix_ods.app_events(_dlq) (zymix_flink)",
       RuntimeEnvironment: "FLINK-1_20",
       ServiceExecutionRole: $role,
       ApplicationConfiguration: ({

@@ -37,9 +37,9 @@ class SqlJobRunnerTest {
                 plan.config);
         assertEquals(List.of("execution.checkpointing.interval", "execution.checkpointing.mode",
                 "execution.checkpointing.min-pause", "restart-strategy"), plan.skippedSets);
-        // Kafka 源表、Doris 结果表、解析视图
-        assertEquals(3, plan.ddl.size());
-        assertEquals(1, plan.inserts.size());
+        // 链路 1：Kafka 源表、Doris 结果表、解析视图；链路 2（DLQ）：Kafka 源表、Doris 结果表
+        assertEquals(5, plan.ddl.size());
+        assertEquals(2, plan.inserts.size());
         assertTrue(plan.ddl.get(2).startsWith("CREATE TEMPORARY VIEW telemetry_events_parsed"));
         assertFalse(plan.ddl.get(2).contains("sasl"), "视图不是 Kafka 表，不应被追加认证选项");
         String insert = plan.inserts.get(0);
@@ -58,6 +58,19 @@ class SqlJobRunnerTest {
         assertFalse(doris.contains("benodes"), "未配置的 DORIS_BENODES 应被去掉");
         assertFalse(doris.contains("AWS_MSK_IAM"));
         assertFalse(SqlJobRunner.mask(doris).contains("secret"));
+
+        // DLQ：独立消费组和 label 前缀，同样追加 IAM 认证
+        String dlqKafka = plan.ddl.get(3);
+        assertTrue(dlqKafka.contains("'topic' = 'telemetry.events.dlq'"));
+        assertTrue(dlqKafka.contains("'properties.group.id' = 'zymix-ods-dlq'"));
+        assertTrue(dlqKafka.contains("'properties.sasl.mechanism' = 'AWS_MSK_IAM'"));
+
+        String dlqDoris = plan.ddl.get(4);
+        assertTrue(dlqDoris.contains("'table.identifier' = 'zymix_ods.app_events_dlq'"));
+        assertTrue(dlqDoris.contains("'sink.label-prefix' = 'zo_1_dlq'"));
+        assertTrue(dlqDoris.contains("'sink.enable-2pc' = 'false'"));
+        assertFalse(dlqDoris.contains("benodes"));
+        assertTrue(plan.inserts.get(1).startsWith("INSERT INTO app_events_dlq_sink"));
     }
 
     @Test
