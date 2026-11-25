@@ -11,6 +11,7 @@ Flink SQL 作业工程，部署到 AWS Managed Service for Apache Flink。
 ```
 sql/                    Flink SQL 脚本，构建时打进 jar 的 sql/ 目录
   telemetry_kafka_to_zymix_ods.sql  埋点 telemetry.events → zymix_ods.app_events
+                                    DLQ  telemetry.events.dlq → zymix_ods.app_events_dlq（同一个作业）
 ddl/zymix_ods/          VeloDB 建表语句（需有写权限的账号执行）
 src/main/java/com/zymix/flink/
   SqlJobRunner.java     入口：读配置 → 解析脚本 → 提交作业
@@ -61,8 +62,23 @@ jar 传到同一个桶，应用不存在就创建（Flink 1.20），存在就更
 Doris 账号从 Secrets Manager `next/prod/flink/velodb_etl` 读（字段 `DORIS_USER` / `DORIS_PASSWORD`），密码不进应用配置。
 Checkpoint 用服务默认配置，并行度 1；脚本里的同类 SET 会被跳过。
 
+## 监控告警
+
+线上应用 `flink_kafka_velodb_zymix_ods` 有 3 个 CloudWatch 告警，通知发到 SNS 主题 `zymix-data-alerts`（邮件）：
+
+| 告警 | 条件 |
+|---|---|
+| `zymix-flink-flink_kafka_velodb_zymix_ods-down` | 连续 3 分钟不在运行（无数据也算） |
+| `zymix-flink-flink_kafka_velodb_zymix_ods-restarts` | 5 分钟内重启 ≥ 2 次 |
+| `zymix-flink-flink_kafka_velodb_zymix_ods-checkpoint-failed` | 5 分钟内 checkpoint 失败 ≥ 2 次 |
+
+完整策略、新应用建告警的命令、加收件人、下线删除，见 `zymix_data/monitoring/README.md` 的「zymix 作业的告警」一节。
+新部署一个应用后记得照那里建 3 个告警。
+
 ## 注意
 
 - `ZYMIX_ODS_LABEL_PREFIX` 每次重新提交（不从快照恢复）都要换，否则 Doris label 冲突，作业反复重启。
 - VeloDB（存算分离）对 MoW 表不支持 2PC stream load，写 VeloDB 的 Doris sink 必须 `'sink.enable-2pc' = 'false'`。
 - 新增脚本直接放进 `sql/`，用 `SQL_FILE` 选择；一个托管应用跑一个脚本。
+- 一个脚本里可以有多个源表和多条 INSERT，合成一个作业。每个 Kafka 源表用自己的消费组，每个 Doris sink 用自己的 `sink.label-prefix`。
+- 改了作业拓扑（增删源表 / INSERT）后，旧快照里的算子 ID 对不上，要停应用、换 `LABEL_PREFIX`、以 `SKIP_RESTORE_FROM_SNAPSHOT` 启动；Kafka 源用 `group-offsets` 从消费组位点续读。

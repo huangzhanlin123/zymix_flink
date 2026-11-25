@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
 # 一键配置托管 Flink 应用 flink_kafka_velodb_zymix_ods
-#   Kafka telemetry.events → zymix_ods.app_events（jar：zymix_flink 仓库）
+#   Kafka telemetry.events     → zymix_ods.app_events
+#   Kafka telemetry.events.dlq → zymix_ods.app_events_dlq（jar：zymix_flink 仓库）
 #
 # 在 268502217808 账号的 AWS CloudShell（eu-central-1）里运行：
 #   bash configure_flink_kafka_velodb_zymix_ods.sh            # 只配置，不启动
@@ -10,7 +11,7 @@
 # 参照线上应用 telemetry_kafka_to_ods 的配置（同一个服务角色、数据角色、VPC、日志组）。
 # 会做的事（每一步改动前都会打印出来，确认后才执行）：
 #   1. 检查 jar 在 S3
-#   2. 检查数据角色能否读 velodb_etl secret、能否用新的消费组读 MSK；缺的权限确认后补到数据角色上
+#   2. 检查数据角色能否读 velodb_etl secret、能否用新的消费组读两个 topic；缺的权限确认后补到数据角色上
 #   3. 应用不存在就创建，存在就更新：代码位置、运行时属性、快照开、并行度 1、关自动扩缩、VPC、日志
 #   4. START=1 时启动
 # Doris 密码只在运行时从 Secrets Manager 读，本脚本不读、不打印。
@@ -34,8 +35,9 @@ SECRET_ARN="arn:aws:secretsmanager:eu-central-1:268502217808:secret:next/prod/fl
 
 KAFKA_BROKERS="boot-syluwxnk.c3.kafka-serverless.eu-central-1.amazonaws.com:9098"
 TOPIC="telemetry.events"
-GROUP_ID="${GROUP_ID:-zymix-ods-app-events}"          # 不能和线上的 telemetry-ods 相同
-LABEL_PREFIX="${LABEL_PREFIX:-zymix_ods_app_events_v1}" # 不从快照恢复的重新启动时要换（v2、v3…）
+DLQ_TOPIC="telemetry.events.dlq"
+GROUP_ID="${GROUP_ID:-zymix-ods-app-events}"          # 不能和线上的 telemetry-ods 相同；DLQ 源表用 ${GROUP_ID}-dlq
+LABEL_PREFIX="${LABEL_PREFIX:-zymix_ods_app_events_v1}" # 不从快照恢复的重新启动时要换（v2、v3…）；DLQ sink 用 ${LABEL_PREFIX}_dlq
 DORIS_FENODES="lb-95540229-09f9844ddebbbe4e.elb.eu-central-1.amazonaws.com:8080"
 
 SUBNETS=(subnet-09e9c3453d32c1fd6 subnet-0d2f2bfce06aff583 subnet-0adc332e4192b39d2)
@@ -82,7 +84,9 @@ if [[ -n "$CLUSTER_ARN" ]]; then
   CLUSTER_PATH="${CLUSTER_ARN#*:cluster/}"                 # <name>/<uuid>
   KAFKA_ARN_PREFIX="${CLUSTER_ARN%%:cluster/*}"            # arn:aws:kafka:<region>:<account>
   TOPIC_ARN="${KAFKA_ARN_PREFIX}:topic/${CLUSTER_PATH}/${TOPIC}"
+  DLQ_TOPIC_ARN="${KAFKA_ARN_PREFIX}:topic/${CLUSTER_PATH}/${DLQ_TOPIC}"
   GROUP_ARN="${KAFKA_ARN_PREFIX}:group/${CLUSTER_PATH}/${GROUP_ID}"
+  DLQ_GROUP_ARN="${KAFKA_ARN_PREFIX}:group/${CLUSTER_PATH}/${GROUP_ID}-dlq"
 else
   warn "没找到 bootstrap 对应的 MSK 集群（可能没有 kafka:ListClustersV2 权限），跳过 MSK 权限检查"
 fi
@@ -123,20 +127,32 @@ if [[ -n "$CLUSTER_ARN" && "$SIM_UNAVAILABLE" == 0 ]]; then
   d1="$(denied_actions "$CLUSTER_ARN" kafka-cluster:Connect kafka-cluster:DescribeCluster)"
   d2="$(denied_actions "$TOPIC_ARN" kafka-cluster:DescribeTopic kafka-cluster:ReadData)"
   d3="$(denied_actions "$GROUP_ARN" kafka-cluster:DescribeGroup kafka-cluster:AlterGroup)"
+  d4="$(denied_actions "$DLQ_TOPIC_ARN" kafka-cluster:DescribeTopic kafka-cluster:ReadData)"
+  d5="$(denied_actions "$DLQ_GROUP_ARN" kafka-cluster:DescribeGroup kafka-cluster:AlterGroup)"
   [[ -z "$d1" ]] && ok "数据角色能连接 MSK 集群" || { warn "缺集群权限：$d1"
     add_statement MskConnect "[\"$CLUSTER_ARN\"]" kafka-cluster:Connect kafka-cluster:DescribeCluster; }
   [[ -z "$d2" ]] && ok "数据角色能读 topic $TOPIC" || { warn "缺 topic 权限：$d2"
     add_statement MskReadTopic "[\"$TOPIC_ARN\"]" kafka-cluster:DescribeTopic kafka-cluster:ReadData; }
   [[ -z "$d3" ]] && ok "数据角色能用消费组 $GROUP_ID" || { warn "缺消费组权限：$d3"
     add_statement MskZymixOdsGroup "[\"$GROUP_ARN\"]" kafka-cluster:DescribeGroup kafka-cluster:AlterGroup; }
+  [[ -z "$d4" ]] && ok "数据角色能读 topic $DLQ_TOPIC" || { warn "缺 topic 权限：$d4"
+    add_statement MskReadDlqTopic "[\"$DLQ_TOPIC_ARN\"]" kafka-cluster:DescribeTopic kafka-cluster:ReadData; }
+  [[ -z "$d5" ]] && ok "数据角色能用消费组 ${GROUP_ID}-dlq" || { warn "缺消费组权限：$d5"
+    add_statement MskZymixOdsDlqGroup "[\"$DLQ_GROUP_ARN\"]" kafka-cluster:DescribeGroup kafka-cluster:AlterGroup; }
 fi
 [[ "$SIM_UNAVAILABLE" == 1 ]] && warn "没有 iam:SimulatePrincipalPolicy 权限，无法预检数据角色；启动后看日志是否有 AccessDenied"
 
 if [[ "$(jq length <<<"$MISSING_STATEMENTS")" -gt 0 ]]; then
-  POLICY="$(jq -c '{Version: "2012-10-17", Statement: .}' <<<"$MISSING_STATEMENTS")"
+  # put-role-policy 会整体覆盖同名内联策略：先取出已有语句，按 Sid 合并，否则重跑脚本会丢掉之前加的权限
+  EXISTING_STATEMENTS="$("${AWS[@]}" iam get-role-policy --role-name "$DATA_ROLE_NAME" \
+      --policy-name zymix-ods-app-events --query 'PolicyDocument.Statement' --output json 2>/dev/null || echo '[]')"
+  POLICY="$(jq -c --argjson old "$EXISTING_STATEMENTS" '
+    ([.[].Sid] as $new | [$old[] | select(.Sid as $s | $new | index($s) | not)]) + .
+    | {Version: "2012-10-17", Statement: .}' <<<"$MISSING_STATEMENTS")"
   echo
-  echo "数据角色 $DATA_ROLE_NAME（线上作业也在用）需要新增内联策略 zymix-ods-app-events，只增加以下权限："
-  jq . <<<"$POLICY"
+  echo "数据角色 $DATA_ROLE_NAME（线上作业也在用）的内联策略 zymix-ods-app-events 需要补上以下权限："
+  jq . <<<"$MISSING_STATEMENTS"
+  echo "（合并已有语句后的完整策略共 $(jq '.Statement | length' <<<"$POLICY") 条）"
   if confirm "给数据角色加上这条策略？"; then
     "${AWS[@]}" iam put-role-policy --role-name "$DATA_ROLE_NAME" \
       --policy-name zymix-ods-app-events --policy-document "$POLICY"
@@ -221,7 +237,7 @@ if [[ -z "$EXISTING" ]]; then
     --argjson groups "$PROPERTY_GROUPS" --argjson subnets "$SUBNETS_JSON" --argjson sgs "$SGS_JSON" \
     --arg logarn "$LOG_STREAM_ARN" '{
       ApplicationName: $name,
-      ApplicationDescription: "Kafka telemetry.events -> zymix_ods.app_events",
+      ApplicationDescription: "Kafka telemetry.events(.dlq) -> zymix_ods.app_events(_dlq)",
       RuntimeEnvironment: "FLINK-1_20",
       ServiceExecutionRole: $role,
       ApplicationConfiguration: {
@@ -309,6 +325,7 @@ cat <<EOF
 - 控制台：https://${REGION}.console.aws.amazon.com/flink/home?region=${REGION}#/applications/${APP}
 - 启动：aws --region ${REGION} kinesisanalyticsv2 start-application --application-name ${APP} --run-configuration '{"ApplicationRestoreConfiguration":{"ApplicationRestoreType":"SKIP_RESTORE_FROM_SNAPSHOT"}}'
 - 日志：aws --region ${REGION} logs tail '${LOG_GROUP:-<日志组>}' --log-stream-names ${APP} --follow --since 10m
-- 正常的标志：日志里有「Doris 账号已从 Secrets Manager 读取」「作业已提交」，Flink 控制面板作业 RUNNING、checkpoint 成功
+- 正常的标志：日志里有「Doris 账号已从 Secrets Manager 读取」「作业已提交」，Flink 控制面板作业 RUNNING、checkpoint 成功，
+  zymix_ods.app_events 和 zymix_ods.app_events_dlq 都有新数据
 - 以后不从快照恢复的启动，先改 LABEL_PREFIX（如 v2）再运行本脚本
 EOF

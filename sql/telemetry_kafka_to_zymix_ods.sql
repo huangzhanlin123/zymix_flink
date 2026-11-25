@@ -2,7 +2,7 @@
 -- 原则：只提取分区和主键需要的最小字段，payload 原文逐字节落库。
 --   用 format='raw' 而不是 'json'：json 格式会把消息解析成列再序列化回去，原文就不再是原文了。
 --
--- 目标表 DDL：ddl/zymix_ods/app_events.sql（先建表再启动作业）。
+-- 目标表 DDL：ddl/zymix_ods/app_events.sql、ddl/zymix_ods/app_events_dlq.sql（先建表再启动作业）。
 --
 -- 变量（托管 Flink 的 Runtime properties，或本地 --props 文件）：
 --   KAFKA_BROKERS             MSK 地址（MSK Serverless 只支持 IAM，配合 KAFKA_IAM=true）
@@ -11,6 +11,12 @@
 --   ZYMIX_ODS_STARTUP_MODE    首次启动的位置，默认 group-offsets（消费组没有位点时退回 earliest）
 --   DORIS_FENODES / DORIS_BENODES(可选) / DORIS_USER / DORIS_PASSWORD（或 DORIS_SECRET_ID）
 --   ZYMIX_ODS_LABEL_PREFIX    Doris stream load label 前缀，**每次不从快照恢复的重新提交都要换**
+--                             （DLQ sink 用 <前缀>_dlq，跟着一起换）
+--   TELEMETRY_DLQ_TOPIC       DLQ topic，默认 telemetry.events.dlq；DLQ 消费组固定为 <ZYMIX_ODS_GROUP_ID>-dlq
+--
+-- 一个作业两条链路（运行器把两条 INSERT 合进同一个 StatementSet）：
+--   1. telemetry.events     → zymix_ods.app_events
+--   2. telemetry.events.dlq → zymix_ods.app_events_dlq（telemetry-svc 校验不通过、带原因转发的事件）
 
 SET 'pipeline.name' = 'telemetry_kafka_to_zymix_ods';
 -- 数仓约定日期按 UTC。TO_TIMESTAMP_LTZ → DATE / TIMESTAMP 的换算依赖会话时区，
@@ -128,3 +134,110 @@ WHERE event_id IS NOT NULL
   --    「30 天」按追数时的处理时间算，停机期间的老事件可能因此被丢掉。
   AND event_time >= proc_time - INTERVAL '30' DAY
   AND event_time <  proc_time + INTERVAL '2' DAY;
+
+
+-- ============================================================================
+-- 链路 2：telemetry.events.dlq → zymix_ods.app_events_dlq
+--   DLQ 消息没有 event_id，主键是 (received_date, kafka_partition, kafka_offset)：
+--   同一条消息重放多少次都收敛成一行，所以同样可以关 2PC。
+--   来自 Studio 笔记本 zymix_data/telemetry/flink/studio_dlq_to_ods.sql，迁过来后笔记本那个 INSERT 要停掉。
+-- ============================================================================
+
+CREATE TABLE kafka_telemetry_dlq (
+    payload         STRING,
+    kafka_partition INT              METADATA FROM 'partition' VIRTUAL,
+    kafka_offset    BIGINT           METADATA FROM 'offset'    VIRTUAL,
+    kafka_ts        TIMESTAMP_LTZ(3) METADATA FROM 'timestamp' VIRTUAL
+) WITH (
+    'connector' = 'kafka',
+    'topic' = '${TELEMETRY_DLQ_TOPIC:telemetry.events.dlq}',
+    'properties.bootstrap.servers' = '${KAFKA_BROKERS}',
+    -- 独立消费组：两张源表各自提交位点，互不影响
+    'properties.group.id' = '${ZYMIX_ODS_GROUP_ID}-dlq',
+    'properties.isolation.level' = 'read_committed',
+    'scan.startup.mode' = '${ZYMIX_ODS_STARTUP_MODE:group-offsets}',
+    -- 新消费组第一次启动从最早开始，DLQ 全量历史重放一遍（按主键收敛，不会重复）
+    'properties.auto.offset.reset' = 'earliest',
+    'scan.topic-partition-discovery.interval' = '5min',
+    'format' = 'raw'
+);
+
+CREATE TABLE app_events_dlq_sink (
+    received_date    DATE,
+    kafka_partition  INT,
+    kafka_offset     BIGINT,
+    reason           STRING,
+    detail           STRING,
+    missing_property STRING,
+    event_name       STRING,
+    client_event_id  STRING,
+    event_time       TIMESTAMP(3),
+    received_at      TIMESTAMP(3),
+    schema_version   INT,
+    app_id           STRING,
+    app_version      STRING,
+    device_id        STRING,
+    payload          STRING,
+    kafka_ts         TIMESTAMP(3)
+) WITH (
+    'connector' = 'doris',
+    'fenodes' = '${DORIS_FENODES}',
+    'benodes' = '${DORIS_BENODES:}',
+    'table.identifier' = 'zymix_ods.app_events_dlq',
+    'username' = '${DORIS_USER}',
+    'password' = '${DORIS_PASSWORD}',
+    -- 和 app_events_sink 的 label 必须不同，否则两个 sink 的 label 互相冲突
+    'sink.label-prefix' = '${ZYMIX_ODS_LABEL_PREFIX}_dlq',
+    'sink.properties.format' = 'json',
+    'sink.properties.read_json_by_line' = 'true',
+    'sink.buffer-flush.max-rows' = '10000',
+    'sink.buffer-flush.interval' = '5s',
+    'sink.max-retries' = '3',
+    -- 个别坏行（如字段超长）不拖垮整批
+    'sink.properties.max_filter_ratio' = '0.05',
+    'sink.enable-2pc' = 'false'
+);
+
+INSERT INTO app_events_dlq_sink
+SELECT
+    -- 按接收日期分区：坏数据的 event_time 可能是 0、负数、未来时间，按它分区会大量落不进分区
+    CAST(COALESCE(received_at, kafka_ts_utc) AS DATE)                    AS received_date,
+    kafka_partition,
+    kafka_offset,
+    JSON_VALUE(payload, '$.reason')                                      AS reason,
+    JSON_VALUE(payload, '$.detail')                                      AS detail,
+    REGEXP_EXTRACT(JSON_VALUE(payload, '$.detail'),
+                   'missing required property \W([\w.]+)', 1)          AS missing_property,
+    JSON_VALUE(payload, '$.event_name')                                  AS event_name,
+    JSON_VALUE(payload, '$.client_event_id')                             AS client_event_id,
+    event_time,
+    received_at,
+    TRY_CAST(JSON_VALUE(payload, '$.schema_version') AS INT)             AS schema_version,
+    JSON_VALUE(payload, '$.app_id')                                      AS app_id,
+    JSON_VALUE(payload, '$.app_version')                                 AS app_version,
+    JSON_VALUE(payload, '$.device_id')                                   AS device_id,
+    payload,
+    kafka_ts_utc                                                         AS kafka_ts
+FROM (
+    SELECT
+        payload,
+        kafka_partition,
+        kafka_offset,
+        -- 会话时区是 UTC，转成的 TIMESTAMP 即 UTC 时间
+        CAST(kafka_ts AS TIMESTAMP(3)) AS kafka_ts_utc,
+        -- 只接受 2000-01-01 ~ 2100-01-01 之间的毫秒时间戳，其余置 NULL，避免脏时间戳让 Doris 过滤整行
+        CASE WHEN ev_ms BETWEEN 946684800000 AND 4102444800000
+             THEN CAST(TO_TIMESTAMP_LTZ(ev_ms, 3) AS TIMESTAMP(3)) END AS event_time,
+        CASE WHEN rv_ms BETWEEN 946684800000 AND 4102444800000
+             THEN CAST(TO_TIMESTAMP_LTZ(rv_ms, 3) AS TIMESTAMP(3)) END AS received_at
+    FROM (
+        SELECT
+            payload,
+            kafka_partition,
+            kafka_offset,
+            kafka_ts,
+            TRY_CAST(JSON_VALUE(payload, '$.event_time_ms')  AS BIGINT) AS ev_ms,
+            TRY_CAST(JSON_VALUE(payload, '$.received_at_ms') AS BIGINT) AS rv_ms
+        FROM kafka_telemetry_dlq
+    ) t0
+) t1;
